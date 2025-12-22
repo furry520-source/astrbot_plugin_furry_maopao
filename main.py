@@ -85,7 +85,7 @@ class TimeSlot:
     "astrbot_plugin_furry_maopao",
     "AstrBot 芝士雪豹",
     "自动群打卡发言插件 - 支持每日自动打卡和分时段发言",
-    "1.0.0",
+    "1.3.1",  # 更新版本号
     "https://github.com/furry520-source/astrbot_plugin_furry_maopao",
 )
 class AutoGroupChat(Star):
@@ -143,6 +143,9 @@ class AutoGroupChat(Star):
         self.last_reset_date: str = ""  # 上次重置日期
         self.checkin_history: List[Dict] = []  # 打卡历史记录
         
+        # 新增：发言历史记录（按日期存储，用于调试）
+        self.chat_history: List[Dict] = []
+        
         # 数据存储
         data_dir = StarTools.get_data_dir("astrbot_plugin_furry_maopao")
         self.data_path = data_dir / "auto_chat_data.json"
@@ -163,7 +166,7 @@ class AutoGroupChat(Star):
         # 启动定时任务
         self._setup_scheduler()
         
-        logger.info(f"🤖 自动群打卡发言插件初始化完成 v1.3.0")
+        logger.info(f"🤖 自动群打卡发言插件初始化完成 v1.3.1")
         logger.info(f"⏰ 时间段配置:")
         for slot_name, slot in self.time_slots.items():
             if slot.is_enabled():
@@ -176,6 +179,11 @@ class AutoGroupChat(Star):
         logger.info(f"✅ 打卡设置: {'已启用' if self.enable_group_checkin else '已禁用'}")
         if self.enable_group_checkin and self.checkin_time:
             logger.info(f"⏰ 打卡时间: {self.checkin_time}（仅调用API，不发送消息）")
+        
+        # 记录各时段已发言群数
+        for slot_name, slot in self.time_slots.items():
+            if slot.is_enabled():
+                logger.info(f"📊 {slot_name}时段已发言群数: {len(slot.chatted_today)}")
 
     def _load_data(self):
         """加载存储数据"""
@@ -202,17 +210,19 @@ class AutoGroupChat(Star):
                     self.day_count = data.get("day_count", 1)
                     self.last_reset_date = data.get("last_reset_date", "")
                     self.checkin_history = data.get("checkin_history", [])
+                    self.chat_history = data.get("chat_history", [])
                     
                     # 检查是否需要重置每日发言记录
                     self._check_and_reset_daily_chat()
                     
-                    logger.info(f"📊 已加载历史数据：打卡天数={self.day_count}, 历史记录={len(self.checkin_history)}条")
+                    logger.info(f"📊 已加载历史数据：打卡天数={self.day_count}, 历史记录={len(self.checkin_history)}条, 发言记录={len(self.chat_history)}条")
             else:
                 self._reset_daily_chat_data()
                 self.last_group_chat_time = None
                 self.day_count = 1
                 self.last_reset_date = ""
                 self.checkin_history = []
+                self.chat_history = []
         except Exception as e:
             logger.error(f"加载数据失败: {e}")
             self._reset_daily_chat_data()
@@ -220,6 +230,7 @@ class AutoGroupChat(Star):
             self.day_count = 1
             self.last_reset_date = ""
             self.checkin_history = []
+            self.chat_history = []
 
     def _save_data(self):
         """保存数据"""
@@ -235,7 +246,8 @@ class AutoGroupChat(Star):
                 "last_group_chat_time": last_group_time,
                 "day_count": self.day_count,
                 "last_reset_date": self.last_reset_date,
-                "checkin_history": self.checkin_history[-100:]  # 只保留最近100条记录
+                "checkin_history": self.checkin_history[-100:],  # 只保留最近100条记录
+                "chat_history": self.chat_history[-100:]  # 只保留最近100条发言记录
             }
             
             # 保存时间段发言记录
@@ -255,8 +267,26 @@ class AutoGroupChat(Star):
         
         if self.last_reset_date != today:
             logger.info(f"📅 检测到日期变化 {self.last_reset_date} -> {today}，重置每日发言记录")
+            
+            # 记录重置前的状态（用于调试）
+            old_stats = {}
+            for slot_name, slot in self.time_slots.items():
+                if slot.is_enabled():
+                    old_stats[slot_name] = len(slot.chatted_today)
+            
             self._reset_daily_chat_data()
             self.last_reset_date = today
+            
+            # 记录发言历史
+            if old_stats:
+                history_entry = {
+                    "date": self.last_reset_date,
+                    "reset_time": now.isoformat(),
+                    "old_stats": old_stats,
+                    "message": "每日重置"
+                }
+                self.chat_history.append(history_entry)
+            
             self._save_data()
 
     def _reset_daily_chat_data(self):
@@ -355,20 +385,28 @@ class AutoGroupChat(Star):
                 logger.debug("当前不在任何时间段内")
                 return  # 当前不在任何时间段内
             
-            # 找出尚未在该时间段发言的群组
+            logger.info(f"🕒 当前处于 {current_slot.name} 时段 ({current_slot.get_time_range_str()})")
+            
+            # 找出尚未在该时间段发言的群组 - 修复：必须过滤已发言的群
             available_groups = []
+            already_chatted = []
+            
             for group_id in groups_to_chat:
-                if not current_slot.has_chatted_today(group_id):
+                if current_slot.has_chatted_today(group_id):
+                    already_chatted.append(group_id)
+                else:
                     available_groups.append(group_id)
             
+            logger.info(f"📊 群组统计: 总群数={len(groups_to_chat)}, 可发言={len(available_groups)}, 已发言={len(already_chatted)}")
+            
             if not available_groups:
-                logger.debug(f"{current_slot.name}时段所有群组都已发言过")
+                logger.info(f"✅ {current_slot.name}时段所有群组都已发言过")
                 return  # 所有群组都已在该时间段发言过
             
             # 随机选择一个群
             selected_group = random.choice(available_groups)
             
-            logger.info(f"🎯 选择群 {selected_group} 在 {current_slot.name} 时段发言")
+            logger.info(f"🎯 选择群 {selected_group} 在 {current_slot.name} 时段发言 (已过滤已发言群)")
             
             # 执行发言
             await self._execute_chat_for_group(selected_group, current_slot)
@@ -399,7 +437,7 @@ class AutoGroupChat(Star):
                             logger.error(f"获取群列表失败: {e}")
                         break
             
-            logger.debug(f"找到 {len(active_groups)} 个活跃群组")
+            logger.debug(f"找到 {len(active_groups)} 个活跃群组: {active_groups}")
             return active_groups
         except Exception as e:
             logger.error(f"获取活跃群组失败: {e}")
@@ -517,6 +555,11 @@ class AutoGroupChat(Star):
     async def _execute_chat_for_group(self, group_id: str, time_slot: TimeSlot):
         """为指定群组在指定时间段执行发言"""
         try:
+            # 再次检查是否已发言（防止并发问题）
+            if time_slot.has_chatted_today(group_id):
+                logger.warning(f"⚠️ 群 {group_id} 已在 {time_slot.name} 时段发言过，跳过重复发言")
+                return
+            
             # 获取消息内容
             if self.use_llm:
                 message = await self._generate_llm_message_for_slot(time_slot.name)
@@ -535,8 +578,20 @@ class AutoGroupChat(Star):
                         if success:
                             # 标记为已发言
                             time_slot.mark_as_chatted(group_id)
+                            
+                            # 记录发言历史
+                            now = datetime.now(self.timezone)
+                            chat_record = {
+                                "timestamp": now.isoformat(),
+                                "group_id": group_id,
+                                "slot": time_slot.name,
+                                "message": message,
+                                "success": True
+                            }
+                            self.chat_history.append(chat_record)
+                            
                             self._save_data()
-                            logger.info(f"✅ 群 {group_id} {time_slot.name}时段发言完成")
+                            logger.info(f"✅ 群 {group_id} {time_slot.name}时段发言完成，已标记为已发言")
                         else:
                             logger.error(f"❌ 群 {group_id} 发言发送失败")
                         break
@@ -739,6 +794,18 @@ class AutoGroupChat(Star):
             if success:
                 # 标记为已发言
                 current_slot.mark_as_chatted(group_id)
+                
+                # 记录发言历史
+                chat_record = {
+                    "timestamp": now.isoformat(),
+                    "group_id": group_id,
+                    "slot": current_slot.name,
+                    "message": message,
+                    "success": True,
+                    "manual": True
+                }
+                self.chat_history.append(chat_record)
+                
                 self._save_data()
                 yield event.plain_result(f"✅ 已发送发言 ({current_slot.name}时段): {message}")
             else:
@@ -798,8 +865,9 @@ class AutoGroupChat(Star):
         try:
             now = datetime.now(self.timezone)
             current_time = now.time()
+            today = now.date().strftime("%Y-%m-%d")
             
-            status_info = f"🤖 自动发言插件状态 v1.3.0\n"
+            status_info = f"🤖 自动发言插件状态 v1.3.1\n"
             status_info += f"⏰ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             status_info += f"📅 打卡天数: {self.day_count}\n"
             status_info += f"🔧 使用LLM: {'✅ 已开启' if self.use_llm else '❌ 未开启'}\n"
@@ -818,7 +886,7 @@ class AutoGroupChat(Star):
                     status_info += f"✅ 冷却完成，可发言\n"
             
             # 显示时间段状态
-            status_info += f"\n📅 时间段状态:\n"
+            status_info += f"\n📅 时间段状态 (今日 {today}):\n"
             current_slot_name = None
             
             for slot_name, slot in self.time_slots.items():
@@ -831,6 +899,13 @@ class AutoGroupChat(Star):
                     chatted_count = len(slot.chatted_today)
                     status_info += f"  {slot_name}: {slot.get_time_range_str()} ({status})\n"
                     status_info += f"    已发言群数: {chatted_count} 个\n"
+                    if chatted_count > 0:
+                        # 显示部分已发言群ID
+                        sample_groups = list(slot.chatted_today)[:3]
+                        sample_text = ", ".join(sample_groups)
+                        if len(slot.chatted_today) > 3:
+                            sample_text += f" ...等{chatted_count}个群"
+                        status_info += f"    示例群ID: {sample_text}\n"
                 else:
                     status_info += f"  {slot_name}: ❌ 未启用\n"
             
@@ -844,6 +919,13 @@ class AutoGroupChat(Star):
                     status_info += f"  总群数: {len(available_groups)} 个\n"
                     status_info += f"  可发言群: {available_count} 个\n"
                     status_info += f"  已发言群: {len(current_slot.chatted_today)} 个\n"
+                    
+                    # 显示已发言群ID列表
+                    if current_slot.chatted_today:
+                        status_info += f"  已发言群ID: {', '.join(list(current_slot.chatted_today)[:5])}"
+                        if len(current_slot.chatted_today) > 5:
+                            status_info += f" ...等{len(current_slot.chatted_today)}个群"
+                        status_info += "\n"
             
             # 显示打卡历史（最近5条）
             if self.checkin_history:
@@ -856,6 +938,17 @@ class AutoGroupChat(Star):
                     manual = "🔧" if record.get("manual") else "🤖"
                     status_info += f"  {timestamp} {manual} 群{group_id}: {success}\n"
             
+            # 显示发言历史（最近5条）
+            if self.chat_history:
+                status_info += f"\n💬 最近发言记录:\n"
+                recent_chats = self.chat_history[-5:]  # 最近5条
+                for record in reversed(recent_chats):
+                    timestamp = datetime.fromisoformat(record["timestamp"]).strftime("%m-%d %H:%M")
+                    group_id = record["group_id"]
+                    slot = record.get("slot", "未知")
+                    manual = "🔧" if record.get("manual") else "🤖"
+                    status_info += f"  {timestamp} {manual} 群{group_id}({slot})\n"
+            
             yield event.plain_result(status_info)
             
         except Exception as e:
@@ -867,16 +960,37 @@ class AutoGroupChat(Star):
     async def reset_chat_records(self, event: AiocqhttpMessageEvent):
         """重置发言记录"""
         try:
+            old_stats = {}
+            for slot_name, slot in self.time_slots.items():
+                if slot.is_enabled():
+                    old_stats[slot_name] = len(slot.chatted_today)
+            
             self._reset_daily_chat_data()
             self.last_group_chat_time = None
             
             now = datetime.now(self.timezone)
             self.last_reset_date = now.date().strftime("%Y-%m-%d")
+            
+            # 记录手动重置历史
+            history_entry = {
+                "date": self.last_reset_date,
+                "reset_time": now.isoformat(),
+                "old_stats": old_stats,
+                "message": "手动重置",
+                "manual": True
+            }
+            self.chat_history.append(history_entry)
+            
             self._save_data()
             
-            yield event.plain_result("✅ 已重置所有发言记录")
+            response = "✅ 已重置所有发言记录\n"
+            response += "📊 重置前状态:\n"
+            for slot_name, count in old_stats.items():
+                response += f"  {slot_name}: {count}个群已发言\n"
             
-            logger.info("已重置发言记录")
+            yield event.plain_result(response)
+            
+            logger.info(f"已重置发言记录，重置前: {old_stats}")
             
         except Exception as e:
             logger.error(f"重置记录失败: {e}")

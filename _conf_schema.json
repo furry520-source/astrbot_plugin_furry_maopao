@@ -1,0 +1,143 @@
+{
+    "enabled_groups": {
+        "description": "启用的群组列表",
+        "type": "list",
+        "hint": "启用自动发言功能的群组ID列表，如果为空则在所有群组生效",
+        "default": []
+    },
+    "time_slots": {
+        "description": "发言时间段配置",
+        "type": "object",
+        "hint": "配置三个发言时间段，格式为 HH:MM-HH:MM，留空则不启用对应时间段",
+        "items": {
+            "morning": {
+                "description": "早晨时间段",
+                "type": "string",
+                "hint": "例如: 06:40-08:15，留空则不启用",
+                "default": "06:40-08:15"
+            },
+            "noon": {
+                "description": "中午时间段",
+                "type": "string",
+                "hint": "例如: 11:30-13:20，留空则不启用",
+                "default": "11:30-13:20"
+            },
+            "evening": {
+                "description": "晚上时间段",
+                "type": "string",
+                "hint": "例如: 19:20-22:15，留空则不启用",
+                "default": "19:20-22:15"
+            }
+        },
+        "default": {
+            "morning": "06:40-08:15",
+            "noon": "11:30-13:20",
+            "evening": "19:20-22:15"
+        }
+    },
+    "use_llm": {
+        "description": "使用LLM生成内容",
+        "type": "bool",
+        "hint": "开启后使用AI模型生成发言内容，关闭则使用预设回复",
+        "default": false
+    },
+    "llm_provider_id": {
+        "description": "LLM提供商ID",
+        "type": "string",
+        "hint": "使用的LLM模型提供商ID，留空使用默认",
+        "default": ""
+    },
+    "morning_prompts": {
+        "description": "早晨时间段提示词",
+        "type": "list",
+        "hint": "早晨时间段使用的LLM提示词列表",
+        "default": [
+            "生成一句简单的早安问候，如：大家早上好呀~新的一天开始了！",
+            "说一句简短的早安祝福",
+            "简单的早上问候语",
+            "早上好，简短的一句话"
+        ]
+    },
+    "noon_prompts": {
+        "description": "中午时间段提示词",
+        "type": "list",
+        "hint": "中午时间段使用的LLM提示词列表",
+        "default": [
+            "生成一句简单的中午问候，如：中午好，大家吃饭了吗？",
+            "说一句简短的午安祝福",
+            "简单的中午问候语",
+            "中午好，简短的一句话"
+        ]
+    },
+    "evening_prompts": {
+        "description": "晚上时间段提示词",
+        "type": "list",
+        "hint": "晚上时间段使用的LLM提示词列表",
+        "default": [
+            "生成一句简单的晚上问候，如：晚上好，今天过得怎么样？",
+            "说一句简短的晚安祝福",
+            "简单的晚上问候语",
+            "晚上好，简短的一句话"
+        ]
+    },
+    "morning_messages": {
+        "description": "早晨预设消息",
+        "type": "list",
+        "hint": "不使用LLM时早晨时间段的预设发言内容",
+        "default": [
+            "大家早上好呀~新的一天开始了！",
+            "早安！今天也要元气满满哦！",
+            "早晨的阳光真好，大家起床了吗？",
+            "一日之计在于晨，一起加油吧！",
+            "早上好，记得吃早餐哦~"
+        ]
+    },
+    "noon_messages": {
+        "description": "中午预设消息",
+        "type": "list",
+        "hint": "不使用LLM时中午时间段的预设发言内容",
+        "default": [
+            "中午好，大家吃饭了吗？",
+            "午饭时间到，休息一下准备下午的工作吧~",
+            "午安，吃饱了有点困呢",
+            "中午的阳光暖暖的，适合小憩一下",
+            "午休时间到，放松一下吧！"
+        ]
+    },
+    "evening_messages": {
+        "description": "晚上预设消息",
+        "type": "list",
+        "hint": "不使用LLM时晚上时间段的预设发言内容",
+        "default": [
+            "晚上好，今天过得怎么样？",
+            "傍晚了，该休息休息了~",
+            "晚上好，今天有什么收获吗？",
+            "夜幕降临，放松一下吧",
+            "晚上是放松的好时光呢"
+        ]
+    },
+    "group_cooldown": {
+        "description": "群间冷却时间（秒）",
+        "type": "int",
+        "hint": "不同群发言之间的最小间隔时间（秒），避免同时发言，默认300秒（5分钟）",
+        "default": 300
+    },
+    "enable_group_checkin": {
+        "description": "启用群打卡功能",
+        "type": "bool",
+        "hint": "是否启用群打卡功能（调用打卡API，不发送消息）",
+        "default": true
+    },
+    "checkin_time": {
+        "description": "打卡时间",
+        "type": "string",
+        "hint": "每日打卡时间，格式 HH:MM，留空则不打卡",
+        "default": "08:00"
+    },
+    "log_enabled": {
+        "description": "启用日志记录",
+        "type": "bool",
+        "hint": "是否记录详细的发言和打卡日志",
+        "default": true
+    }
+}

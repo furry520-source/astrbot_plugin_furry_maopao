@@ -1,0 +1,6 @@
+name: astrbot_plugin_furry_maopao
+display_name: 爱冒泡
+desc: 【仅QQ】智能群聊助手，支持每日自动打卡和分时段发言，每个时段只发言一次，支持分时段LLM提示词和预设消息。
+version: v1.0.0
+author: 芝士雪豹
+repo: https://github.com/furry520-source/astrbot_plugin_furry_maopao

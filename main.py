@@ -1,18 +1,15 @@
 import random
 import asyncio
 from datetime import datetime, time, timedelta
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple, Optional, Set, Any
 import json
 from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
 import astrbot.api.message_components as Comp
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-    AiocqhttpMessageEvent,
-)
 from astrbot.core.star.filter.permission import PermissionType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.job import Job
@@ -81,13 +78,18 @@ class TimeSlot:
             return f"{self.start_time.strftime('%H:%M')}-{self.end_time.strftime('%H:%M')}"
         return "未启用"
 
-@register(
-    "astrbot_plugin_furry_maopao",
-    "AstrBot 芝士雪豹",
-    "自动群打卡发言插件 - 支持每日自动打卡和分时段发言",
-    "1.3.1",  # 更新版本号
-    "https://github.com/furry520-source/astrbot_plugin_furry_maopao",
-)
+
+class GroupClientInfo:
+    """群组与客户端关联信息"""
+    def __init__(self, group_id: str, platform_type: str, client: Any, platform_name: str = ""):
+        self.group_id = group_id
+        self.platform_type = platform_type  # 平台类型
+        self.client = client  # 客户端实例
+        self.platform_name = platform_name  # 平台名称
+        self.last_checked = datetime.now()  # 最后检查时间
+        self.is_active = True  # 群组是否活跃（机器人是否在群中）
+
+
 class AutoGroupChat(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -146,6 +148,9 @@ class AutoGroupChat(Star):
         # 新增：发言历史记录（按日期存储，用于调试）
         self.chat_history: List[Dict] = []
         
+        # 新增：群组-客户端映射缓存（解决多账号支持问题）
+        self.group_client_map: Dict[str, GroupClientInfo] = {}
+        
         # 数据存储
         data_dir = StarTools.get_data_dir("astrbot_plugin_furry_maopao")
         self.data_path = data_dir / "auto_chat_data.json"
@@ -166,7 +171,7 @@ class AutoGroupChat(Star):
         # 启动定时任务
         self._setup_scheduler()
         
-        logger.info(f"🤖 自动群打卡发言插件初始化完成 v1.3.1")
+        logger.info(f"🤖 自动群打卡发言插件初始化完成 v1.3.4")
         logger.info(f"⏰ 时间段配置:")
         for slot_name, slot in self.time_slots.items():
             if slot.is_enabled():
@@ -368,7 +373,7 @@ class AutoGroupChat(Star):
                     logger.debug(f"冷却中，剩余 {remaining} 秒")
                     return  # 还在冷却中
             
-            # 获取所有启用的群组
+            # 获取所有启用的群组（仅获取活跃群组）
             groups_to_chat = await self._get_active_groups()
             if not groups_to_chat:
                 logger.debug("没有找到启用的群组")
@@ -415,33 +420,199 @@ class AutoGroupChat(Star):
             logger.error(f"检查发言失败: {e}")
 
     async def _get_active_groups(self) -> List[str]:
-        """获取活跃群组列表"""
+        """获取活跃群组列表（修复多账号支持问题）"""
         try:
             platforms = self.context.platform_manager.get_insts()
             active_groups = []
+            current_time = datetime.now()
+            
+            # 清理过期的缓存（30分钟）和标记为不活跃的群
+            expired_groups = []
+            inactive_groups = []
+            
+            for group_id, info in list(self.group_client_map.items()):
+                # 检查是否过期（1小时）
+                if (current_time - info.last_checked).total_seconds() > 3600:
+                    expired_groups.append(group_id)
+                # 检查是否不活跃
+                elif not info.is_active:
+                    inactive_groups.append(group_id)
+            
+            for group_id in expired_groups + inactive_groups:
+                if group_id in self.group_client_map:
+                    del self.group_client_map[group_id]
+                    logger.debug(f"从缓存移除 {'过期' if group_id in expired_groups else '不活跃'} 群组: {group_id}")
             
             for platform in platforms:
                 if hasattr(platform, 'get_client'):
                     client = platform.get_client()
                     if client:
                         try:
+                            # 获取平台信息
+                            platform_type = platform.__class__.__name__
+                            platform_name = getattr(platform, 'name', platform_type)
+                            
+                            # 获取群列表
                             groups = await client.get_group_list()
+                            
+                            # 创建一个当前平台所有群组的集合，用于后续检查
+                            current_platform_groups = set()
+                            
                             for group in groups:
                                 group_id = str(group.get('group_id', ''))
                                 
                                 # 检查是否在启用列表中
                                 if not self.enabled_groups or group_id in self.enabled_groups:
                                     active_groups.append(group_id)
+                                    current_platform_groups.add(group_id)
+                                    
+                                    # 缓存群组-客户端映射
+                                    if group_id not in self.group_client_map:
+                                        self.group_client_map[group_id] = GroupClientInfo(
+                                            group_id=group_id,
+                                            platform_type=platform_type,
+                                            client=client,
+                                            platform_name=platform_name
+                                        )
+                                        logger.debug(f"新增群组缓存: {group_id} ({platform_type})")
+                                    else:
+                                        # 更新最后检查时间和活跃状态
+                                        info = self.group_client_map[group_id]
+                                        info.last_checked = current_time
+                                        info.is_active = True
+                                        info.client = client  # 更新客户端引用
+                            
+                            # 对于已经在缓存中但不在当前群列表中的群组，标记为不活跃
+                            for group_id, info in list(self.group_client_map.items()):
+                                if info.platform_type == platform_type and group_id not in current_platform_groups:
+                                    info.is_active = False
+                                    logger.debug(f"标记群组为不活跃: {group_id} ({platform_type})")
                         
                         except Exception as e:
-                            logger.error(f"获取群列表失败: {e}")
-                        break
+                            logger.error(f"获取群列表失败 ({platform.__class__.__name__}): {e}")
+                            # 继续尝试其他平台，不break
             
-            logger.debug(f"找到 {len(active_groups)} 个活跃群组: {active_groups}")
-            return active_groups
+            # 统计活跃和不活跃的群组
+            active_count = len([info for info in self.group_client_map.values() if info.is_active])
+            inactive_count = len([info for info in self.group_client_map.values() if not info.is_active])
+            
+            logger.info(f"📊 群组统计: 活跃={active_count}个, 不活跃={inactive_count}个, 缓存总数={len(self.group_client_map)}个")
+            logger.debug(f"找到 {len(active_groups)} 个活跃群组")
+            
+            return list(set(active_groups))  # 去重
         except Exception as e:
             logger.error(f"获取活跃群组失败: {e}")
             return []
+
+    async def _verify_group_active(self, group_id: str) -> bool:
+        """验证群组是否活跃（机器人是否还在群中）"""
+        try:
+            if group_id in self.group_client_map:
+                info = self.group_client_map[group_id]
+                
+                # 如果已经标记为不活跃，直接返回False
+                if not info.is_active:
+                    logger.debug(f"群组 {group_id} 已被标记为不活跃")
+                    return False
+                
+                # 尝试获取群信息来验证是否还在群中
+                try:
+                    # 尝试调用获取群信息的API
+                    if hasattr(info.client, 'get_group_info'):
+                        group_info = await info.client.get_group_info(group_id=int(group_id))
+                        if group_info:
+                            # 如果成功获取群信息，说明机器人还在群中
+                            info.is_active = True
+                            info.last_checked = datetime.now()
+                            return True
+                    
+                    # 备用方法：尝试发送一条测试消息（静默失败）
+                    try:
+                        await info.client.send_group_msg(group_id=int(group_id), message="")
+                        info.is_active = True
+                        info.last_checked = datetime.now()
+                        logger.debug(f"群组 {group_id} 验证活跃成功")
+                        return True
+                    except Exception as send_error:
+                        # 如果发送失败，可能机器人已经不在群中
+                        logger.debug(f"群组 {group_id} 发送测试消息失败: {send_error}")
+                        info.is_active = False
+                        return False
+                        
+                except Exception as api_error:
+                    logger.debug(f"群组 {group_id} API验证失败: {api_error}")
+                    info.is_active = False
+                    return False
+            
+            # 如果缓存中没有，尝试重新获取客户端
+            client, platform_type = await self._get_client_for_group(group_id)
+            if client:
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            logger.debug(f"验证群组 {group_id} 活跃状态失败: {e}")
+            # 验证失败时，保守地认为群组不活跃
+            if group_id in self.group_client_map:
+                self.group_client_map[group_id].is_active = False
+            return False
+
+    async def _get_client_for_group(self, group_id: str):
+        """获取指定群组的客户端"""
+        try:
+            # 首先尝试从缓存获取
+            if group_id in self.group_client_map:
+                info = self.group_client_map[group_id]
+                # 检查是否活跃
+                if not info.is_active:
+                    logger.debug(f"群组 {group_id} 已被标记为不活跃，跳过")
+                    return None, None
+                
+                # 验证客户端是否仍然有效
+                try:
+                    # 简单检查客户端是否还有有效属性
+                    if hasattr(info.client, 'send_group_msg'):
+                        return info.client, info.platform_type
+                except:
+                    # 客户端无效，从缓存中移除
+                    del self.group_client_map[group_id]
+            
+            # 缓存中没有或无效，遍历平台查找
+            platforms = self.context.platform_manager.get_insts()
+            for platform in platforms:
+                if hasattr(platform, 'get_client'):
+                    client = platform.get_client()
+                    if client:
+                        try:
+                            # 尝试获取群列表来验证客户端是否在该群
+                            groups = await client.get_group_list()
+                            for group in groups:
+                                if str(group.get('group_id', '')) == group_id:
+                                    # 找到匹配的客户端，缓存它
+                                    platform_type = platform.__class__.__name__
+                                    platform_name = getattr(platform, 'name', platform_type)
+                                    self.group_client_map[group_id] = GroupClientInfo(
+                                        group_id=group_id,
+                                        platform_type=platform_type,
+                                        client=client,
+                                        platform_name=platform_name
+                                    )
+                                    logger.debug(f"重新获取群组 {group_id} 的客户端成功")
+                                    return client, platform_type
+                        except Exception as e:
+                            logger.debug(f"检查群组 {group_id} 客户端失败: {e}")
+                            continue
+            
+            # 没有找到，标记为不活跃（如果存在于缓存中）
+            if group_id in self.group_client_map:
+                self.group_client_map[group_id].is_active = False
+                logger.debug(f"标记群组 {group_id} 为不活跃（未找到客户端）")
+            
+            return None, None
+        except Exception as e:
+            logger.error(f"获取群组 {group_id} 客户端失败: {e}")
+            return None, None
 
     def _get_messages_for_slot(self, slot_name: str) -> List[str]:
         """获取对应时间段的预设消息"""
@@ -537,7 +708,21 @@ class AutoGroupChat(Star):
     async def _send_group_message(self, client, group_id: str, message: str):
         """发送群消息"""
         try:
-            await client.send_group_msg(group_id=int(group_id), message=message)
+            # 先验证群组是否活跃
+            is_active = await self._verify_group_active(group_id)
+            if not is_active:
+                logger.warning(f"群组 {group_id} 不活跃，跳过发送消息")
+                return False
+            
+            # 通用发送方法，适用于多种平台
+            if hasattr(client, 'send_group_msg'):
+                await client.send_group_msg(group_id=int(group_id), message=message)
+            elif hasattr(client, 'send_message'):
+                # 通用发送接口
+                await client.send_message(group_id=int(group_id), message=message)
+            else:
+                logger.error(f"客户端不支持发送群消息: {type(client)}")
+                return False
             
             # 更新发言时间
             now = datetime.now(self.timezone)
@@ -550,6 +735,10 @@ class AutoGroupChat(Star):
             return True
         except Exception as e:
             logger.error(f"发送群消息失败: {e}")
+            # 发送失败可能意味着机器人已经不在群中，标记为不活跃
+            if group_id in self.group_client_map:
+                self.group_client_map[group_id].is_active = False
+                logger.debug(f"发送失败，标记群组 {group_id} 为不活跃")
             return False
 
     async def _execute_chat_for_group(self, group_id: str, time_slot: TimeSlot):
@@ -560,6 +749,15 @@ class AutoGroupChat(Star):
                 logger.warning(f"⚠️ 群 {group_id} 已在 {time_slot.name} 时段发言过，跳过重复发言")
                 return
             
+            # 验证群组是否活跃
+            is_active = await self._verify_group_active(group_id)
+            if not is_active:
+                logger.warning(f"群组 {group_id} 不活跃，跳过发言")
+                # 从当前时段的发言记录中移除（如果存在）
+                if group_id in time_slot.chatted_today:
+                    time_slot.chatted_today.remove(group_id)
+                return
+            
             # 获取消息内容
             if self.use_llm:
                 message = await self._generate_llm_message_for_slot(time_slot.name)
@@ -568,33 +766,34 @@ class AutoGroupChat(Star):
             
             logger.info(f"📤 准备发送消息到群 {group_id} ({time_slot.name}时段): {message}")
             
+            # 获取正确的客户端（修复"Spray and Pray"问题）
+            client, platform_type = await self._get_client_for_group(group_id)
+            if not client:
+                logger.error(f"❌ 找不到群 {group_id} 的客户端，无法发送消息")
+                return
+            
             # 发送消息
-            platforms = self.context.platform_manager.get_insts()
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client:
-                        success = await self._send_group_message(client, group_id, message)
-                        if success:
-                            # 标记为已发言
-                            time_slot.mark_as_chatted(group_id)
-                            
-                            # 记录发言历史
-                            now = datetime.now(self.timezone)
-                            chat_record = {
-                                "timestamp": now.isoformat(),
-                                "group_id": group_id,
-                                "slot": time_slot.name,
-                                "message": message,
-                                "success": True
-                            }
-                            self.chat_history.append(chat_record)
-                            
-                            self._save_data()
-                            logger.info(f"✅ 群 {group_id} {time_slot.name}时段发言完成，已标记为已发言")
-                        else:
-                            logger.error(f"❌ 群 {group_id} 发言发送失败")
-                        break
+            success = await self._send_group_message(client, group_id, message)
+            if success:
+                # 标记为已发言
+                time_slot.mark_as_chatted(group_id)
+                
+                # 记录发言历史
+                now = datetime.now(self.timezone)
+                chat_record = {
+                    "timestamp": now.isoformat(),
+                    "group_id": group_id,
+                    "slot": time_slot.name,
+                    "platform": platform_type,
+                    "message": message,
+                    "success": True
+                }
+                self.chat_history.append(chat_record)
+                
+                self._save_data()
+                logger.info(f"✅ 群 {group_id} {time_slot.name}时段发言完成，已标记为已发言")
+            else:
+                logger.error(f"❌ 群 {group_id} 发言发送失败")
         
         except Exception as e:
             logger.error(f"执行群 {group_id} 发言失败: {e}")
@@ -608,7 +807,7 @@ class AutoGroupChat(Star):
             now = datetime.now(self.timezone)
             logger.info(f"⏰ 开始执行群打卡，时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
             
-            # 获取所有启用的群组
+            # 获取所有启用的群组（仅获取活跃群组）
             groups_to_checkin = await self._get_active_groups()
             
             if not groups_to_checkin:
@@ -620,6 +819,12 @@ class AutoGroupChat(Star):
             
             for group_id in groups_to_checkin:
                 try:
+                    # 先验证群组是否活跃
+                    is_active = await self._verify_group_active(group_id)
+                    if not is_active:
+                        logger.warning(f"群组 {group_id} 不活跃，跳过打卡")
+                        continue
+                    
                     # 调用打卡API
                     api_success = await self._execute_group_checkin(group_id)
                     if api_success:
@@ -673,58 +878,57 @@ class AutoGroupChat(Star):
             logger.error(f"执行群打卡失败: {e}")
 
     async def _execute_group_checkin(self, group_id: str):
-        """执行群打卡API调用 - 使用/send_group_sign接口"""
+        """执行群打卡API调用 - 使用/send_group_sign接口，改进平台兼容性"""
         try:
-            platforms = self.context.platform_manager.get_insts()
-            for platform in platforms:
-                if hasattr(platform, 'get_client'):
-                    client = platform.get_client()
-                    if client:
-                        # 根据OpenAPI规范调用/send_group_sign接口
-                        try:
-                            # 方法1：直接调用send_group_sign方法
-                            if hasattr(client.api, 'send_group_sign'):
-                                ret = await client.api.send_group_sign(group_id=int(group_id))
-                                logger.debug(f"群 {group_id} 打卡API调用结果: {ret}")
-                                return True
-                            
-                            # 方法2：使用call_action调用/send_group_sign
-                            ret = await client.api.call_action('send_group_sign', group_id=int(group_id))
-                            logger.debug(f"群 {group_id} 打卡API调用结果: {ret}")
-                            
-                            # 检查返回结果
-                            if ret is None:
-                                logger.warning(f"群 {group_id} 打卡API返回None")
-                                return False
-                            
-                            # 尝试解析返回结果
-                            if isinstance(ret, dict):
-                                if 'retcode' in ret and ret['retcode'] == 0:
-                                    return True
-                                elif 'status' in ret and ret['status'] == 'ok':
-                                    return True
-                                else:
-                                    logger.warning(f"群 {group_id} 打卡API返回异常: {ret}")
-                                    return False
-                            else:
-                                # 如果返回不是字典，认为成功
-                                return True
-                                
-                        except AttributeError as e:
-                            logger.warning(f"send_group_sign方法不存在，尝试其他方式: {e}")
-                            # 尝试更通用的方法
-                            try:
-                                # 尝试使用send_group_msg发送空消息（模拟打卡）
-                                await client.send_group_msg(group_id=int(group_id), message="")
-                                logger.info(f"群 {group_id} 使用备用方法打卡成功")
-                                return True
-                            except Exception as inner_e:
-                                logger.error(f"群 {group_id} 备用方法也失败: {inner_e}")
-                                return False
-                        except Exception as e:
-                            logger.error(f"群 {group_id} 打卡API调用异常: {e}")
+            # 获取正确的客户端
+            client, platform_type = await self._get_client_for_group(group_id)
+            if not client:
+                logger.error(f"找不到群 {group_id} 的客户端，无法打卡")
+                return False
+            
+            # 检查平台类型，仅对OneBot/QQ平台尝试打卡
+            if not any(keyword in platform_type.lower() for keyword in ['aiocqhttp', 'onebot', 'qq']):
+                logger.info(f"群 {group_id} 所在平台 {platform_type} 不支持打卡功能，跳过")
+                return False
+            
+            # 根据OpenAPI规范调用/send_group_sign接口
+            try:
+                # 方法1：直接调用send_group_sign方法
+                if hasattr(client.api, 'send_group_sign'):
+                    ret = await client.api.send_group_sign(group_id=int(group_id))
+                    logger.debug(f"群 {group_id} 打卡API调用结果: {ret}")
+                    return True
+                
+                # 方法2：使用call_action调用/send_group_sign
+                if hasattr(client.api, 'call_action'):
+                    ret = await client.api.call_action('send_group_sign', group_id=int(group_id))
+                    logger.debug(f"群 {group_id} 打卡API调用结果: {ret}")
+                    
+                    # 检查返回结果
+                    if ret is None:
+                        logger.warning(f"群 {group_id} 打卡API返回None")
+                        return False
+                    
+                    # 尝试解析返回结果
+                    if isinstance(ret, dict):
+                        if 'retcode' in ret and ret['retcode'] == 0:
+                            return True
+                        elif 'status' in ret and ret['status'] == 'ok':
+                            return True
+                        else:
+                            logger.warning(f"群 {group_id} 打卡API返回异常: {ret}")
                             return False
-            return False
+                    else:
+                        # 如果返回不是字典，认为成功
+                        return True
+                
+                logger.warning(f"群 {group_id} 所在平台 {platform_type} 不支持打卡API")
+                return False
+                
+            except Exception as e:
+                logger.error(f"群 {group_id} 打卡API调用异常: {e}")
+                return False
+                
         except Exception as e:
             logger.error(f"调用群打卡API失败: {e}")
             return False
@@ -744,7 +948,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("立即发言")
-    async def immediate_chat(self, event: AiocqhttpMessageEvent):
+    async def immediate_chat(self, event: AstrMessageEvent):
         """立即在指定群发言"""
         try:
             group_id = event.get_group_id()
@@ -779,6 +983,12 @@ class AutoGroupChat(Star):
                     yield event.plain_result(f"❌ 冷却中，请等待 {remaining} 秒")
                     return
             
+            # 验证群组是否活跃
+            is_active = await self._verify_group_active(group_id)
+            if not is_active:
+                yield event.plain_result(f"❌ 群组 {group_id} 不活跃（机器人可能已退出该群）")
+                return
+            
             yield event.plain_result("🔄 正在生成发言内容...")
             
             # 获取消息内容
@@ -787,8 +997,12 @@ class AutoGroupChat(Star):
             else:
                 message = self._get_random_message_for_slot(current_slot.name)
             
-            # 发送消息
-            client = event.bot
+            # 获取客户端并发送消息
+            client, platform_type = await self._get_client_for_group(group_id)
+            if not client:
+                yield event.plain_result("❌ 找不到群组的客户端，无法发送消息")
+                return
+            
             success = await self._send_group_message(client, group_id, message)
             
             if success:
@@ -800,6 +1014,7 @@ class AutoGroupChat(Star):
                     "timestamp": now.isoformat(),
                     "group_id": group_id,
                     "slot": current_slot.name,
+                    "platform": platform_type,
                     "message": message,
                     "success": True,
                     "manual": True
@@ -817,7 +1032,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("立即打卡")
-    async def immediate_checkin(self, event: AiocqhttpMessageEvent):
+    async def immediate_checkin(self, event: AstrMessageEvent):
         """立即执行打卡（只调用API）"""
         try:
             if not self.enable_group_checkin:
@@ -827,6 +1042,18 @@ class AutoGroupChat(Star):
             group_id = event.get_group_id()
             if not group_id:
                 yield event.plain_result("❌ 请在群聊中使用此命令")
+                return
+            
+            # 验证群组是否活跃
+            is_active = await self._verify_group_active(group_id)
+            if not is_active:
+                yield event.plain_result(f"❌ 群组 {group_id} 不活跃（机器人可能已退出该群）")
+                return
+            
+            # 检查平台类型
+            platform_type = event.get_platform_name()
+            if not any(keyword in platform_type.lower() for keyword in ['aiocqhttp', 'onebot', 'qq']):
+                yield event.plain_result(f"❌ 当前平台 {platform_type} 不支持打卡功能")
                 return
             
             yield event.plain_result("🔄 正在调用打卡API...")
@@ -860,14 +1087,17 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("发言状态")
-    async def chat_status(self, event: AiocqhttpMessageEvent):
+    async def chat_status(self, event: AstrMessageEvent):
         """查看插件状态"""
         try:
             now = datetime.now(self.timezone)
             current_time = now.time()
             today = now.date().strftime("%Y-%m-%d")
             
-            status_info = f"🤖 自动发言插件状态 v1.3.1\n"
+            # 获取活跃群组
+            active_groups = await self._get_active_groups()
+            
+            status_info = f"🤖 自动发言插件状态 v1.3.4\n"
             status_info += f"⏰ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             status_info += f"📅 打卡天数: {self.day_count}\n"
             status_info += f"🔧 使用LLM: {'✅ 已开启' if self.use_llm else '❌ 未开启'}\n"
@@ -875,6 +1105,12 @@ class AutoGroupChat(Star):
             status_info += f"✅ 群打卡: {'已开启' if self.enable_group_checkin else '已关闭'}\n"
             if self.enable_group_checkin and self.checkin_time:
                 status_info += f"⏰ 打卡时间: {self.checkin_time}（仅调用API）\n"
+            
+            # 显示群组统计
+            active_count = len([info for info in self.group_client_map.values() if info.is_active])
+            inactive_count = len([info for info in self.group_client_map.values() if not info.is_active])
+            status_info += f"📊 群组统计: 活跃={active_count}个, 不活跃={inactive_count}个, 缓存总数={len(self.group_client_map)}个\n"
+            status_info += f"📊 当前活跃群组: {len(active_groups)}个\n"
             
             # 显示冷却状态
             if self.last_group_chat_time:
@@ -912,11 +1148,10 @@ class AutoGroupChat(Star):
             # 显示当前时段详情
             if current_slot_name:
                 current_slot = self.time_slots[current_slot_name]
-                available_groups = await self._get_active_groups()
-                if available_groups:
-                    available_count = len([g for g in available_groups if not current_slot.has_chatted_today(g)])
+                if active_groups:
+                    available_count = len([g for g in active_groups if not current_slot.has_chatted_today(g)])
                     status_info += f"\n📊 {current_slot_name}时段详情:\n"
-                    status_info += f"  总群数: {len(available_groups)} 个\n"
+                    status_info += f"  总活跃群数: {len(active_groups)} 个\n"
                     status_info += f"  可发言群: {available_count} 个\n"
                     status_info += f"  已发言群: {len(current_slot.chatted_today)} 个\n"
                     
@@ -926,6 +1161,22 @@ class AutoGroupChat(Star):
                         if len(current_slot.chatted_today) > 5:
                             status_info += f" ...等{len(current_slot.chatted_today)}个群"
                         status_info += "\n"
+            
+            # 显示客户端映射缓存信息
+            if self.group_client_map:
+                platform_stats = {}
+                for info in self.group_client_map.values():
+                    if info.platform_type not in platform_stats:
+                        platform_stats[info.platform_type] = {"active": 0, "inactive": 0}
+                    if info.is_active:
+                        platform_stats[info.platform_type]["active"] += 1
+                    else:
+                        platform_stats[info.platform_type]["inactive"] += 1
+                
+                status_info += f"\n📡 平台连接状态:\n"
+                for platform, stats in platform_stats.items():
+                    total = stats["active"] + stats["inactive"]
+                    status_info += f"  {platform}: {total}个群组 (活跃:{stats['active']}, 不活跃:{stats['inactive']})\n"
             
             # 显示打卡历史（最近5条）
             if self.checkin_history:
@@ -957,7 +1208,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("重置发言记录")
-    async def reset_chat_records(self, event: AiocqhttpMessageEvent):
+    async def reset_chat_records(self, event: AstrMessageEvent):
         """重置发言记录"""
         try:
             old_stats = {}
@@ -998,7 +1249,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("查看时段消息")
-    async def view_slot_messages(self, event: AiocqhttpMessageEvent, slot_name: str = ""):
+    async def view_slot_messages(self, event: AstrMessageEvent, slot_name: str = ""):
         """查看时段消息配置"""
         try:
             if slot_name and slot_name in ["morning", "noon", "evening"]:
@@ -1043,7 +1294,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("添加时段消息")
-    async def add_slot_message(self, event: AiocqhttpMessageEvent, slot_name: str, *, message: str):
+    async def add_slot_message(self, event: AstrMessageEvent, slot_name: str, *, content: str):
         """添加时段消息"""
         try:
             if slot_name not in ["morning", "noon", "evening"]:
@@ -1053,31 +1304,31 @@ class AutoGroupChat(Star):
             if self.use_llm:
                 # 添加提示词
                 if slot_name == "morning":
-                    self.morning_prompts.append(message)
+                    self.morning_prompts.append(content)
                     self.config["morning_prompts"] = self.morning_prompts
                 elif slot_name == "noon":
-                    self.noon_prompts.append(message)
+                    self.noon_prompts.append(content)
                     self.config["noon_prompts"] = self.noon_prompts
                 elif slot_name == "evening":
-                    self.evening_prompts.append(message)
+                    self.evening_prompts.append(content)
                     self.config["evening_prompts"] = self.evening_prompts
             else:
                 # 添加预设消息
                 if slot_name == "morning":
-                    self.morning_messages.append(message)
+                    self.morning_messages.append(content)
                     self.config["morning_messages"] = self.morning_messages
                 elif slot_name == "noon":
-                    self.noon_messages.append(message)
+                    self.noon_messages.append(content)
                     self.config["noon_messages"] = self.noon_messages
                 elif slot_name == "evening":
-                    self.evening_messages.append(message)
+                    self.evening_messages.append(content)
                     self.config["evening_messages"] = self.evening_messages
             
             self.config.save_config()
             
-            yield event.plain_result(f"✅ 已为 {slot_name} 时段添加{'提示词' if self.use_llm else '预设消息'}\n💬 {message[:50]}...")
+            yield event.plain_result(f"✅ 已为 {slot_name} 时段添加{'提示词' if self.use_llm else '预设消息'}\n💬 {content[:50]}...")
             
-            logger.info(f"添加 {slot_name} 时段消息: {message[:50]}...")
+            logger.info(f"添加 {slot_name} 时段消息: {content[:50]}...")
             
         except Exception as e:
             logger.error(f"添加时段消息失败: {e}")
@@ -1085,7 +1336,7 @@ class AutoGroupChat(Star):
 
     @filter.permission_type(PermissionType.ADMIN)
     @filter.command("测试时段发言")
-    async def test_slot_chat(self, event: AiocqhttpMessageEvent, slot_name: str):
+    async def test_slot_chat(self, event: AstrMessageEvent, slot_name: str):
         """测试时段发言"""
         try:
             if slot_name not in ["morning", "noon", "evening"]:
